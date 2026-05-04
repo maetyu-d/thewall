@@ -1,9 +1,10 @@
 import { getStore } from "@netlify/blobs";
 
 const STORE_NAME = "forever-drawing-wall";
-const MAX_STROKES_PER_LOAD = 2500;
+const MAX_STROKES_PER_LOAD = 8000;
 const MAX_POINTS = 900;
-const MAX_BODY_BYTES = 180_000;
+const MAX_BODY_BYTES = 900_000;
+const MAX_BATCH_STROKES = 24;
 
 const jsonHeaders = {
   "content-type": "application/json; charset=utf-8",
@@ -19,7 +20,7 @@ export default async (request) => {
     const store = getStore(STORE_NAME);
 
     if (request.method === "GET") {
-      return await loadDrawing(store);
+      return await loadDrawing(store, request);
     }
 
     if (request.method === "POST") {
@@ -33,20 +34,23 @@ export default async (request) => {
   }
 };
 
-async function loadDrawing(store) {
+async function loadDrawing(store, request) {
+  const since = Number(new URL(request.url).searchParams.get("since")) || 0;
   const { blobs } = await store.list({ prefix: "strokes/" });
   const keys = blobs
     .map((blob) => blob.key)
     .sort()
+    .filter((key) => shouldFetchKey(key, since))
     .slice(-MAX_STROKES_PER_LOAD);
-  const strokes = [];
 
-  await Promise.all(
-    keys.map(async (key) => {
-      const value = await store.get(key, { consistency: "strong", type: "json" });
-      if (value) strokes.push(value);
-    })
+  const results = await Promise.allSettled(
+    keys.map((key) => store.get(key, { consistency: "strong", type: "json" }))
   );
+  const strokes = results
+    .filter((result) => result.status === "fulfilled" && result.value)
+    .map((result) => result.value)
+    .filter((stroke) => isSupportedSavedStroke(stroke))
+    .filter((stroke) => !since || Number(stroke.createdAt) > since);
 
   strokes.sort((a, b) => a.createdAt - b.createdAt);
   return json({
@@ -69,21 +73,41 @@ async function saveStroke(request, store) {
     return json({ error: "That mark was not valid JSON." }, 400);
   }
 
-  const stroke = normalizeStroke(payload);
-  const key = `strokes/${stroke.id}.json`;
+  const payloads = Array.isArray(payload.strokes) ? payload.strokes.slice(0, MAX_BATCH_STROKES) : [payload];
+  const saved = [];
+  const failed = [];
 
-  await store.setJSON(key, stroke, {
-    metadata: { createdAt: stroke.createdAt }
-  });
+  for (const item of payloads) {
+    try {
+      const stroke = normalizeStroke(item);
+      const key = `strokes/${stroke.createdAt}-${stroke.id}.json`;
 
-  return json({ ok: true, key, id: stroke.id, createdAt: stroke.createdAt }, 201);
+      await store.setJSON(key, stroke, {
+        metadata: { createdAt: stroke.createdAt }
+      });
+
+      saved.push({ key, id: stroke.id, createdAt: stroke.createdAt });
+    } catch (error) {
+      failed.push({ error: error.message || "Invalid stroke" });
+    }
+  }
+
+  if (!saved.length) {
+    return json({ ok: false, saved, failed }, 400);
+  }
+
+  return json({ ok: failed.length === 0, saved, failed }, failed.length ? 207 : 201);
 }
 
 function normalizeStroke(payload) {
   const id = typeof payload.id === "string" && /^[0-9a-f-]{20,80}$/i.test(payload.id)
     ? payload.id
     : crypto.randomUUID();
-  const tool = pick(payload.tool, ["brush", "eraser"], "brush");
+  if (!["brush", "eraser"].includes(payload.tool)) {
+    throw new Error("Unsupported drawing tool.");
+  }
+
+  const tool = payload.tool;
   const color = typeof payload.color === "string" && /^#[0-9a-f]{6}$/i.test(payload.color)
     ? payload.color
     : "#111111";
@@ -107,6 +131,19 @@ function normalizeStroke(payload) {
   };
 }
 
+function shouldFetchKey(key, since) {
+  if (!since) return true;
+  const match = key.match(/^strokes\/(\d{13})-/);
+  return !match || Number(match[1]) > since;
+}
+
+function isSupportedSavedStroke(stroke) {
+  return stroke
+    && ["brush", "eraser"].includes(stroke.tool)
+    && Array.isArray(stroke.points)
+    && stroke.points.length > 1;
+}
+
 function normalizePoint(point) {
   if (!point || typeof point !== "object") return null;
   const x = Number(point.x);
@@ -116,10 +153,6 @@ function normalizePoint(point) {
     x: clamp(x, 0, 1, 0),
     y: clamp(y, 0, 1, 0)
   };
-}
-
-function pick(value, allowed, fallback) {
-  return allowed.includes(value) ? value : fallback;
 }
 
 function clamp(value, min, max, fallback) {

@@ -4,6 +4,11 @@ const statusEl = document.querySelector("#status");
 const sizeInput = document.querySelector("#size");
 const eraseButton = document.querySelector("#erase");
 
+const api = "/api/drawing";
+const paperColor = "#fffef8";
+const maxBatchSize = 12;
+const requestTimeout = 10000;
+
 const state = {
   tool: "brush",
   color: "#111111",
@@ -21,8 +26,6 @@ const state = {
   canvasHeight: 1
 };
 
-const api = "/api/drawing";
-
 setupControls();
 resizeCanvas();
 await loadWall();
@@ -37,8 +40,18 @@ window.addEventListener("resize", () => {
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
     loadWall();
+    queuePendingRetry(100);
+  } else {
+    flushPendingWithBeacon();
   }
 });
+
+window.addEventListener("online", () => {
+  loadWall();
+  queuePendingRetry(100);
+});
+
+window.addEventListener("pagehide", flushPendingWithBeacon);
 
 canvas.addEventListener("pointerdown", (event) => {
   canvas.setPointerCapture(event.pointerId);
@@ -86,7 +99,9 @@ async function loadWall() {
   state.loading = true;
 
   try {
-    const response = await fetch(`${api}?t=${Date.now()}`, { cache: "no-store" });
+    const params = new URLSearchParams({ t: String(Date.now()) });
+    if (state.strokes.length && state.newest) params.set("since", String(Math.max(0, state.newest - 120000)));
+    const response = await fetchWithTimeout(`${api}?${params}`, { cache: "no-store" });
     if (!response.ok) throw new Error("Load failed");
     const data = await response.json();
     const incoming = Array.isArray(data.strokes) ? data.strokes : [];
@@ -134,18 +149,20 @@ async function flushPending() {
   setStatus("Saving...", false);
 
   try {
-    for (const stroke of [...state.pending]) {
-      const response = await fetch(api, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(stroke)
-      });
+    const batch = state.pending.slice(0, maxBatchSize);
+    const response = await fetchWithTimeout(api, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ strokes: batch })
+    });
 
-      if (!response.ok) throw new Error("Save failed");
-      const saved = await response.json();
-      markSaved(stroke.id, saved);
+    if (!response.ok) throw new Error("Save failed");
+    const result = await response.json();
+    for (const saved of normalizeSavedResults(result)) {
+      markSaved(saved.id, saved);
     }
 
+    if (result.failed?.length) throw new Error("Some marks failed");
     setStatus("Saved for the next visitor.", true);
     await loadWall();
   } catch {
@@ -187,6 +204,7 @@ function redrawAll() {
 
 function drawStroke(stroke) {
   if (!stroke?.points?.length) return;
+  if (!["brush", "eraser"].includes(stroke.tool)) return;
 
   for (let index = 1; index < stroke.points.length; index += 1) {
     drawSegment(stroke.points[index - 1], stroke.points[index], stroke, index);
@@ -201,13 +219,17 @@ function drawSegment(from, to, stroke, index = 0) {
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
   ctx.lineWidth = stroke.size;
-  ctx.strokeStyle = stroke.tool === "eraser" ? "#fffef8" : stroke.color;
+  ctx.strokeStyle = stroke.tool === "eraser" ? paperColor : getStrokeColor(stroke, index);
 
   ctx.beginPath();
   ctx.moveTo(start.x, start.y);
   ctx.lineTo(end.x, end.y);
   ctx.stroke();
   ctx.restore();
+}
+
+function getStrokeColor(stroke, index) {
+  return stroke.color;
 }
 
 function getPoint(event) {
@@ -272,6 +294,7 @@ function mergeStrokes(...groups) {
   for (const group of groups) {
     for (const stroke of group || []) {
       if (!stroke?.points?.length) continue;
+      if (!["brush", "eraser"].includes(stroke.tool)) continue;
       const key = stroke.id || `${stroke.createdAt}-${stroke.tool}-${stroke.points[0].x}-${stroke.points[0].y}`;
       byId.set(key, { ...byId.get(key), ...stroke, id: key });
     }
@@ -286,7 +309,7 @@ function hasStrokeChanges(next, current) {
 }
 
 function addPending(stroke) {
-  if (!state.pending.some((pending) => pending.id === stroke.id)) {
+  if (isSupportedStroke(stroke) && !state.pending.some((pending) => pending.id === stroke.id)) {
     state.pending.push(stroke);
     savePendingStrokes();
   }
@@ -315,7 +338,9 @@ function bumpPendingAttempts() {
 
 function queuePendingRetry(delay = 2500) {
   clearTimeout(state.retryTimer);
-  state.retryTimer = setTimeout(flushPending, delay);
+  const attempts = Math.max(0, ...state.pending.map((stroke) => stroke.attempts || 0));
+  const backoff = state.pending.length ? Math.min(30000, delay * (2 ** Math.min(attempts, 4))) : delay;
+  state.retryTimer = setTimeout(flushPending, backoff);
 }
 
 function scheduleRefresh() {
@@ -328,7 +353,7 @@ function loadPendingStrokes() {
   try {
     const value = localStorage.getItem("forever-doodle-pending");
     const strokes = JSON.parse(value || "[]");
-    return Array.isArray(strokes) ? strokes : [];
+    return Array.isArray(strokes) ? strokes.filter(isSupportedStroke) : [];
   } catch {
     return [];
   }
@@ -340,4 +365,45 @@ function savePendingStrokes() {
   } catch {
     // The in-memory queue still protects marks for this visit.
   }
+}
+
+function normalizeSavedResults(result) {
+  if (Array.isArray(result.saved)) return result.saved;
+  if (result.id) return [result];
+  return [];
+}
+
+async function fetchWithTimeout(url, options = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), requestTimeout);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function flushPendingWithBeacon() {
+  if (!state.pending.length || !navigator.sendBeacon) return;
+
+  const batch = state.pending.slice(0, Math.min(8, maxBatchSize));
+  const body = JSON.stringify({ strokes: batch });
+  const sent = navigator.sendBeacon(api, new Blob([body], { type: "application/json" }));
+  if (sent) {
+    setTimeout(() => {
+      loadWall();
+      queuePendingRetry(500);
+    }, 1200);
+  }
+}
+
+function isSupportedStroke(stroke) {
+  return stroke
+    && ["brush", "eraser"].includes(stroke.tool)
+    && Array.isArray(stroke.points)
+    && stroke.points.length > 1;
 }
