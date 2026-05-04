@@ -43,7 +43,7 @@ async function loadDrawing(store) {
 
   await Promise.all(
     keys.map(async (key) => {
-      const value = await store.get(key, { type: "json" });
+      const value = await store.get(key, { consistency: "strong", type: "json" });
       if (value) strokes.push(value);
     })
   );
@@ -73,8 +73,7 @@ async function saveStroke(request, store) {
   const key = `strokes/${stroke.id}.json`;
 
   await store.setJSON(key, stroke, {
-    metadata: { createdAt: stroke.createdAt },
-    onlyIfNew: true
+    metadata: { createdAt: stroke.createdAt }
   });
 
   return json({ ok: true, key, id: stroke.id, createdAt: stroke.createdAt }, 201);

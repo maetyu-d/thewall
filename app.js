@@ -14,7 +14,9 @@ const state = {
   pending: loadPendingStrokes(),
   newest: 0,
   saving: 0,
+  loading: false,
   retryTimer: null,
+  refreshTimer: null,
   canvasWidth: 1,
   canvasHeight: 1
 };
@@ -26,11 +28,17 @@ setupControls();
 resizeCanvas();
 await loadWall();
 queuePendingRetry(600);
-setInterval(loadWall, 15000);
+scheduleRefresh();
 
 window.addEventListener("resize", () => {
   resizeCanvas();
   redrawAll();
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) {
+    loadWall();
+  }
 });
 
 canvas.addEventListener("pointerdown", (event) => {
@@ -89,8 +97,11 @@ function setupControls() {
 }
 
 async function loadWall() {
+  if (state.loading) return;
+  state.loading = true;
+
   try {
-    const response = await fetch(api, { cache: "no-store" });
+    const response = await fetch(`${api}?t=${Date.now()}`, { cache: "no-store" });
     if (!response.ok) throw new Error("Load failed");
     const data = await response.json();
     const incoming = Array.isArray(data.strokes) ? data.strokes : [];
@@ -111,6 +122,9 @@ async function loadWall() {
     redrawAll();
     setStatus("Connection wobble: your marks are queued here and will retry.", false);
     queuePendingRetry();
+  } finally {
+    state.loading = false;
+    scheduleRefresh();
   }
 }
 
@@ -376,6 +390,12 @@ function bumpPendingAttempts() {
 function queuePendingRetry(delay = 2500) {
   clearTimeout(state.retryTimer);
   state.retryTimer = setTimeout(flushPending, delay);
+}
+
+function scheduleRefresh() {
+  clearTimeout(state.refreshTimer);
+  const delay = document.hidden ? 15000 : 2500;
+  state.refreshTimer = setTimeout(loadWall, delay);
 }
 
 function loadPendingStrokes() {
