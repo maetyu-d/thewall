@@ -62,18 +62,28 @@ async function saveStroke(request, store) {
     return json({ error: "That stroke is too large." }, 413);
   }
 
-  const payload = JSON.parse(text);
-  const stroke = normalizeStroke(payload);
-  const key = `strokes/${stroke.createdAt}-${crypto.randomUUID()}.json`;
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    return json({ error: "That mark was not valid JSON." }, 400);
+  }
 
-  await store.set(key, JSON.stringify(stroke), {
-    metadata: { createdAt: stroke.createdAt }
+  const stroke = normalizeStroke(payload);
+  const key = `strokes/${stroke.id}.json`;
+
+  await store.setJSON(key, stroke, {
+    metadata: { createdAt: stroke.createdAt },
+    onlyIfNew: true
   });
 
-  return json({ ok: true, key, createdAt: stroke.createdAt }, 201);
+  return json({ ok: true, key, id: stroke.id, createdAt: stroke.createdAt }, 201);
 }
 
 function normalizeStroke(payload) {
+  const id = typeof payload.id === "string" && /^[0-9a-f-]{20,80}$/i.test(payload.id)
+    ? payload.id
+    : crypto.randomUUID();
   const tool = pick(payload.tool, ["brush", "rainbow", "spray", "stamp", "eraser"], "brush");
   const color = typeof payload.color === "string" && /^#[0-9a-f]{6}$/i.test(payload.color)
     ? payload.color
@@ -93,12 +103,14 @@ function normalizeStroke(payload) {
   }
 
   return {
+    id,
     tool,
     color,
     size,
     stamp,
     points,
-    createdAt: Date.now()
+    createdAt: clamp(Number(payload.createdAt), 1_700_000_000_000, Date.now() + 86_400_000, Date.now()),
+    receivedAt: Date.now()
   };
 }
 

@@ -11,8 +11,10 @@ const state = {
   drawing: false,
   current: [],
   strokes: [],
+  pending: loadPendingStrokes(),
   newest: 0,
   saving: 0,
+  retryTimer: null,
   canvasWidth: 1,
   canvasHeight: 1
 };
@@ -23,6 +25,7 @@ const rainbowColors = ["#ff3864", "#ff8c1a", "#ffd500", "#37c871", "#1e9bff", "#
 setupControls();
 resizeCanvas();
 await loadWall();
+queuePendingRetry(600);
 setInterval(loadWall, 15000);
 
 window.addEventListener("resize", () => {
@@ -91,36 +94,68 @@ async function loadWall() {
     if (!response.ok) throw new Error("Load failed");
     const data = await response.json();
     const incoming = Array.isArray(data.strokes) ? data.strokes : [];
+    const merged = mergeStrokes(incoming, state.strokes, state.pending);
+    const newest = Math.max(0, ...merged.map((stroke) => stroke.createdAt || 0));
 
-    if (incoming.length !== state.strokes.length || data.newest !== state.newest) {
-      state.strokes = incoming;
-      state.newest = data.newest || 0;
+    if (hasStrokeChanges(merged, state.strokes) || newest !== state.newest) {
+      state.strokes = merged;
+      state.newest = newest;
       redrawAll();
     }
 
-    setStatus(state.saving ? "Saving..." : `${data.total || incoming.length} saved marks on the wall`, true);
+    const pendingLabel = state.pending.length ? `, ${state.pending.length} still retrying` : "";
+    setStatus(state.saving ? "Saving..." : `${data.total || incoming.length} saved marks on the wall${pendingLabel}`, true);
+    if (state.pending.length) queuePendingRetry();
   } catch {
-    setStatus("Offline preview: drawing works, saving starts on Netlify.", false);
+    state.strokes = mergeStrokes(state.strokes, state.pending);
+    redrawAll();
+    setStatus("Connection wobble: your marks are queued here and will retry.", false);
+    queuePendingRetry();
   }
 }
 
 async function saveStroke(stroke) {
+  const localStroke = {
+    ...stroke,
+    id: stroke.id || crypto.randomUUID(),
+    createdAt: stroke.createdAt || Date.now(),
+    attempts: stroke.attempts || 0
+  };
+
+  addPending(localStroke);
+  state.strokes = mergeStrokes(state.strokes, [localStroke]);
+  redrawAll();
+  queuePendingRetry(20);
+}
+
+async function flushPending() {
+  if (!state.pending.length || state.saving) return;
+
   state.saving += 1;
   setStatus("Saving...", false);
 
   try {
-    const response = await fetch(api, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(stroke)
-    });
-    if (!response.ok) throw new Error("Save failed");
-    state.strokes.push(stroke);
+    for (const stroke of [...state.pending]) {
+      const response = await fetch(api, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(stroke)
+      });
+
+      if (!response.ok) throw new Error("Save failed");
+      const saved = await response.json();
+      markSaved(stroke.id, saved);
+    }
+
     setStatus("Saved for the next visitor.", true);
+    await loadWall();
   } catch {
-    setStatus("That mark stayed local, but did not save.", false);
+    bumpPendingAttempts();
+    setStatus("Still trying to save. Your marks remain on this screen.", false);
+    queuePendingRetry();
   } finally {
     state.saving -= 1;
+    if (state.pending.length) queuePendingRetry();
   }
 }
 
@@ -137,6 +172,8 @@ function finishStroke() {
 
 function makeStroke(points) {
   return {
+    id: crypto.randomUUID(),
+    createdAt: Date.now(),
     tool: state.tool,
     color: state.color,
     size: state.size,
@@ -286,5 +323,75 @@ function setStatus(message, fade) {
   if (fade) {
     clearTimeout(setStatus.timer);
     setStatus.timer = setTimeout(() => statusEl.classList.add("hide"), 1600);
+  }
+}
+
+function mergeStrokes(...groups) {
+  const byId = new Map();
+
+  for (const group of groups) {
+    for (const stroke of group || []) {
+      if (!stroke?.points?.length) continue;
+      const key = stroke.id || `${stroke.createdAt}-${stroke.tool}-${stroke.points[0].x}-${stroke.points[0].y}`;
+      byId.set(key, { ...byId.get(key), ...stroke, id: key });
+    }
+  }
+
+  return [...byId.values()].sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+}
+
+function hasStrokeChanges(next, current) {
+  if (next.length !== current.length) return true;
+  return next.some((stroke, index) => stroke.id !== current[index]?.id || stroke.createdAt !== current[index]?.createdAt);
+}
+
+function addPending(stroke) {
+  if (!state.pending.some((pending) => pending.id === stroke.id)) {
+    state.pending.push(stroke);
+    savePendingStrokes();
+  }
+}
+
+function markSaved(id, saved) {
+  state.pending = state.pending.filter((stroke) => stroke.id !== id);
+  state.strokes = state.strokes.map((stroke) => {
+    if (stroke.id !== id) return stroke;
+    return {
+      ...stroke,
+      id: saved.id || stroke.id,
+      createdAt: saved.createdAt || stroke.createdAt
+    };
+  });
+  savePendingStrokes();
+}
+
+function bumpPendingAttempts() {
+  state.pending = state.pending.map((stroke) => ({
+    ...stroke,
+    attempts: (stroke.attempts || 0) + 1
+  }));
+  savePendingStrokes();
+}
+
+function queuePendingRetry(delay = 2500) {
+  clearTimeout(state.retryTimer);
+  state.retryTimer = setTimeout(flushPending, delay);
+}
+
+function loadPendingStrokes() {
+  try {
+    const value = localStorage.getItem("forever-doodle-pending");
+    const strokes = JSON.parse(value || "[]");
+    return Array.isArray(strokes) ? strokes : [];
+  } catch {
+    return [];
+  }
+}
+
+function savePendingStrokes() {
+  try {
+    localStorage.setItem("forever-doodle-pending", JSON.stringify(state.pending.slice(-200)));
+  } catch {
+    // The in-memory queue still protects marks for this visit.
   }
 }
