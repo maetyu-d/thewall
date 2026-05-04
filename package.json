@@ -9,7 +9,8 @@
     "build": "node scripts/build-check.mjs"
   },
   "dependencies": {
-    "@netlify/blobs": "^9.1.0"
+    "@netlify/blobs": "^9.1.0",
+    "sharp": "^0.34.3"
   },
   "devDependencies": {
     "netlify-cli": "^23.9.7"

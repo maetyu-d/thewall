@@ -1,10 +1,15 @@
 import { getStore } from "@netlify/blobs";
+import sharp from "sharp";
 
 const STORE_NAME = "forever-drawing-wall";
 const MAX_STROKES_PER_LOAD = 8000;
 const MAX_POINTS = 900;
 const MAX_BODY_BYTES = 900_000;
 const MAX_BATCH_STROKES = 24;
+const COMPACT_EVERY = 500;
+const RASTER_WIDTH = 1600;
+const RASTER_HEIGHT = 1000;
+const PAPER_COLOR = "#fffef8";
 
 const jsonHeaders = {
   "content-type": "application/json; charset=utf-8",
@@ -20,6 +25,10 @@ export default async (request) => {
     const store = getStore(STORE_NAME);
 
     if (request.method === "GET") {
+      const url = new URL(request.url);
+      if (url.searchParams.has("layer")) {
+        return await loadLayer(store, url.searchParams.get("layer"));
+      }
       return await loadDrawing(store, request);
     }
 
@@ -36,15 +45,18 @@ export default async (request) => {
 
 async function loadDrawing(store, request) {
   const since = Number(new URL(request.url).searchParams.get("since")) || 0;
-  const { blobs } = await store.list({ prefix: "strokes/" });
-  const keys = blobs
-    .map((blob) => blob.key)
-    .sort()
+  await tryEnsureRasterLayers(store);
+
+  const strokeKeys = await listStrokeKeys(store);
+  const layers = await listLayerKeys(store);
+  const compactedCount = layers.length * COMPACT_EVERY;
+  const looseKeys = strokeKeys
+    .slice(compactedCount)
     .filter((key) => shouldFetchKey(key, since))
     .slice(-MAX_STROKES_PER_LOAD);
 
   const results = await Promise.allSettled(
-    keys.map((key) => store.get(key, { consistency: "strong", type: "json" }))
+    looseKeys.map((key) => store.get(key, { consistency: "strong", type: "json" }))
   );
   const strokes = results
     .filter((result) => result.status === "fulfilled" && result.value)
@@ -54,9 +66,34 @@ async function loadDrawing(store, request) {
 
   strokes.sort((a, b) => a.createdAt - b.createdAt);
   return json({
+    layers: layers.map((key) => ({
+      key,
+      url: `/api/drawing?layer=${encodeURIComponent(key)}`,
+      width: RASTER_WIDTH,
+      height: RASTER_HEIGHT
+    })),
     strokes,
-    total: blobs.length,
+    total: strokeKeys.length,
+    compacted: compactedCount,
     newest: strokes.at(-1)?.createdAt ?? 0
+  });
+}
+
+async function loadLayer(store, key) {
+  if (!/^layers\/\d{6}\.png$/.test(key || "")) {
+    return json({ error: "Layer not found" }, 404);
+  }
+
+  const image = await store.get(key, { consistency: "strong", type: "arrayBuffer" });
+  if (!image) {
+    return json({ error: "Layer not found" }, 404);
+  }
+
+  return new Response(image, {
+    headers: {
+      "content-type": "image/png",
+      "cache-control": "public, max-age=31536000, immutable"
+    }
   });
 }
 
@@ -96,7 +133,88 @@ async function saveStroke(request, store) {
     return json({ ok: false, saved, failed }, 400);
   }
 
+  await tryEnsureRasterLayers(store);
+
   return json({ ok: failed.length === 0, saved, failed }, failed.length ? 207 : 201);
+}
+
+async function tryEnsureRasterLayers(store) {
+  try {
+    await ensureRasterLayers(store);
+  } catch (error) {
+    console.error("Layer compaction failed", error);
+  }
+}
+
+async function ensureRasterLayers(store) {
+  const strokeKeys = await listStrokeKeys(store);
+  const existingLayers = await listLayerKeys(store);
+  const completedLayerCount = Math.floor(strokeKeys.length / COMPACT_EVERY);
+
+  for (let index = existingLayers.length; index < completedLayerCount; index += 1) {
+    const layerKey = `layers/${String(index + 1).padStart(6, "0")}.png`;
+    const batchKeys = strokeKeys.slice(index * COMPACT_EVERY, (index + 1) * COMPACT_EVERY);
+    const strokes = await loadStrokeBatch(store, batchKeys);
+    if (strokes.length !== COMPACT_EVERY) return;
+
+    const png = await renderLayer(strokes);
+    await store.set(layerKey, png, {
+      metadata: {
+        count: strokes.length,
+        from: strokes[0].createdAt,
+        to: strokes.at(-1).createdAt,
+        width: RASTER_WIDTH,
+        height: RASTER_HEIGHT
+      }
+    });
+  }
+}
+
+async function loadStrokeBatch(store, keys) {
+  const results = await Promise.allSettled(
+    keys.map((key) => store.get(key, { consistency: "strong", type: "json" }))
+  );
+
+  return results
+    .filter((result) => result.status === "fulfilled" && isSupportedSavedStroke(result.value))
+    .map((result) => result.value)
+    .sort((a, b) => a.createdAt - b.createdAt);
+}
+
+async function renderLayer(strokes) {
+  const svg = [
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${RASTER_WIDTH}" height="${RASTER_HEIGHT}" viewBox="0 0 ${RASTER_WIDTH} ${RASTER_HEIGHT}">`,
+    `<rect width="100%" height="100%" fill="transparent"/>`,
+    ...strokes.map(strokeToSvg),
+    "</svg>"
+  ].join("");
+
+  const png = await sharp(Buffer.from(svg)).png().toBuffer();
+  return png.buffer.slice(png.byteOffset, png.byteOffset + png.byteLength);
+}
+
+function strokeToSvg(stroke) {
+  const path = stroke.points
+    .map((point, index) => `${index === 0 ? "M" : "L"} ${round(point.x * RASTER_WIDTH)} ${round(point.y * RASTER_HEIGHT)}`)
+    .join(" ");
+  const color = stroke.tool === "eraser" ? PAPER_COLOR : stroke.color;
+  return `<path d="${path}" fill="none" stroke="${escapeAttr(color)}" stroke-width="${stroke.size}" stroke-linecap="round" stroke-linejoin="round"/>`;
+}
+
+async function listStrokeKeys(store) {
+  const { blobs } = await store.list({ prefix: "strokes/" });
+  return blobs
+    .map((blob) => blob.key)
+    .filter((key) => /^strokes\/\d{13}-[0-9a-f-]{20,80}\.json$/i.test(key))
+    .sort();
+}
+
+async function listLayerKeys(store) {
+  const { blobs } = await store.list({ prefix: "layers/" });
+  return blobs
+    .map((blob) => blob.key)
+    .filter((key) => /^layers\/\d{6}\.png$/.test(key))
+    .sort();
 }
 
 function normalizeStroke(payload) {
@@ -158,6 +276,14 @@ function normalizePoint(point) {
 function clamp(value, min, max, fallback) {
   if (!Number.isFinite(value)) return fallback;
   return Math.min(max, Math.max(min, value));
+}
+
+function round(value) {
+  return Math.round(value * 100) / 100;
+}
+
+function escapeAttr(value) {
+  return String(value).replaceAll("&", "&amp;").replaceAll('"', "&quot;").replaceAll("<", "&lt;");
 }
 
 function json(body, status = 200) {

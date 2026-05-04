@@ -15,8 +15,11 @@ const state = {
   size: Number(sizeInput.value),
   drawing: false,
   current: [],
+  layers: [],
+  layerImages: new Map(),
   strokes: [],
   pending: loadPendingStrokes(),
+  compacted: 0,
   newest: 0,
   saving: 0,
   loading: false,
@@ -100,17 +103,26 @@ async function loadWall() {
 
   try {
     const params = new URLSearchParams({ t: String(Date.now()) });
-    if (state.strokes.length && state.newest) params.set("since", String(Math.max(0, state.newest - 120000)));
     const response = await fetchWithTimeout(`${api}?${params}`, { cache: "no-store" });
     if (!response.ok) throw new Error("Load failed");
     const data = await response.json();
     const incoming = Array.isArray(data.strokes) ? data.strokes : [];
-    const merged = mergeStrokes(incoming, state.strokes, state.pending);
+    const incomingLayers = Array.isArray(data.layers) ? data.layers : [];
+    const compacted = Number(data.compacted) || 0;
+    const baseStrokes = compacted > state.compacted ? [] : state.strokes;
+    const merged = mergeStrokes(incoming, baseStrokes, state.pending);
     const newest = Math.max(0, ...merged.map((stroke) => stroke.createdAt || 0));
+    const layersChanged = hasLayerChanges(incomingLayers, state.layers);
 
-    if (hasStrokeChanges(merged, state.strokes) || newest !== state.newest) {
+    if (layersChanged) {
+      await loadLayerImages(incomingLayers);
+      state.layers = incomingLayers;
+    }
+
+    if (layersChanged || hasStrokeChanges(merged, state.strokes) || newest !== state.newest || compacted !== state.compacted) {
       state.strokes = merged;
       state.newest = newest;
+      state.compacted = compacted;
       redrawAll();
     }
 
@@ -199,6 +211,10 @@ function makeStroke(points) {
 
 function redrawAll() {
   ctx.clearRect(0, 0, state.canvasWidth, state.canvasHeight);
+  for (const layer of state.layers) {
+    const image = state.layerImages.get(layer.key);
+    if (image) ctx.drawImage(image, 0, 0, state.canvasWidth, state.canvasHeight);
+  }
   for (const stroke of state.strokes) drawStroke(stroke);
 }
 
@@ -308,6 +324,11 @@ function hasStrokeChanges(next, current) {
   return next.some((stroke, index) => stroke.id !== current[index]?.id || stroke.createdAt !== current[index]?.createdAt);
 }
 
+function hasLayerChanges(next, current) {
+  if (next.length !== current.length) return true;
+  return next.some((layer, index) => layer.key !== current[index]?.key);
+}
+
 function addPending(stroke) {
   if (isSupportedStroke(stroke) && !state.pending.some((pending) => pending.id === stroke.id)) {
     state.pending.push(stroke);
@@ -371,6 +392,24 @@ function normalizeSavedResults(result) {
   if (Array.isArray(result.saved)) return result.saved;
   if (result.id) return [result];
   return [];
+}
+
+async function loadLayerImages(layers) {
+  await Promise.all(layers.map(loadLayerImage));
+}
+
+async function loadLayerImage(layer) {
+  if (state.layerImages.has(layer.key)) return;
+
+  await new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => {
+      state.layerImages.set(layer.key, image);
+      resolve();
+    };
+    image.onerror = reject;
+    image.src = layer.url;
+  });
 }
 
 async function fetchWithTimeout(url, options = {}) {
