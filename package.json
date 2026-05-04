@@ -1,0 +1,17 @@
+{
+  "name": "persistent-kidpix-wall",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "netlify dev",
+    "start": "netlify dev",
+    "build": "node scripts/build-check.mjs"
+  },
+  "dependencies": {
+    "@netlify/blobs": "^9.1.0"
+  },
+  "devDependencies": {
+    "netlify-cli": "^23.9.7"
+  }
+}
