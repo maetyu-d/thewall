@@ -10,6 +10,7 @@ const COMPACT_EVERY = 500;
 const RASTER_WIDTH = 1600;
 const RASTER_HEIGHT = 1000;
 const PAPER_COLOR = "#fffef8";
+const MANIFEST_KEY = "state/manifest.json";
 
 const jsonHeaders = {
   "content-type": "application/json; charset=utf-8",
@@ -45,13 +46,9 @@ export default async (request) => {
 
 async function loadDrawing(store, request) {
   const since = Number(new URL(request.url).searchParams.get("since")) || 0;
-  await tryEnsureRasterLayers(store);
-
-  const strokeKeys = await listStrokeKeys(store);
-  const layers = await listLayerKeys(store);
-  const compactedCount = layers.length * COMPACT_EVERY;
+  const manifest = await getManifest(store);
+  const strokeKeys = await listLooseKeys(store, manifest.currentBatch);
   const looseKeys = strokeKeys
-    .slice(compactedCount)
     .filter((key) => shouldFetchKey(key, since))
     .slice(-MAX_STROKES_PER_LOAD);
 
@@ -66,15 +63,15 @@ async function loadDrawing(store, request) {
 
   strokes.sort((a, b) => a.createdAt - b.createdAt);
   return json({
-    layers: layers.map((key) => ({
+    layers: manifest.layers.map((key) => ({
       key,
       url: `/api/drawing?layer=${encodeURIComponent(key)}`,
       width: RASTER_WIDTH,
       height: RASTER_HEIGHT
     })),
     strokes,
-    total: strokeKeys.length,
-    compacted: compactedCount,
+    total: manifest.compacted + strokeKeys.length,
+    compacted: manifest.compacted,
     newest: strokes.at(-1)?.createdAt ?? 0
   });
 }
@@ -113,17 +110,29 @@ async function saveStroke(request, store) {
   const payloads = Array.isArray(payload.strokes) ? payload.strokes.slice(0, MAX_BATCH_STROKES) : [payload];
   const saved = [];
   const failed = [];
+  let manifest = await getManifest(store);
 
   for (const item of payloads) {
     try {
       const stroke = normalizeStroke(item);
-      const key = `strokes/${stroke.createdAt}-${stroke.id}.json`;
+      manifest = await getManifest(store);
+      let currentKeys = await listCurrentBatchKeys(store, manifest.currentBatch);
+      if (currentKeys.length >= COMPACT_EVERY) {
+        manifest = await tryEnsureRasterLayers(store, manifest);
+        currentKeys = await listCurrentBatchKeys(store, manifest.currentBatch);
+      }
+
+      const key = strokeKey(manifest.currentBatch, stroke);
 
       await store.setJSON(key, stroke, {
         metadata: { createdAt: stroke.createdAt }
       });
 
       saved.push({ key, id: stroke.id, createdAt: stroke.createdAt });
+
+      if (currentKeys.length + 1 >= COMPACT_EVERY) {
+        manifest = await tryEnsureRasterLayers(store, manifest);
+      }
     } catch (error) {
       failed.push({ error: error.message || "Invalid stroke" });
     }
@@ -132,31 +141,32 @@ async function saveStroke(request, store) {
   if (!saved.length) {
     return json({ ok: false, saved, failed }, 400);
   }
-
-  await tryEnsureRasterLayers(store);
-
   return json({ ok: failed.length === 0, saved, failed }, failed.length ? 207 : 201);
 }
 
-async function tryEnsureRasterLayers(store) {
+async function tryEnsureRasterLayers(store, manifest = null) {
   try {
-    await ensureRasterLayers(store);
+    return await ensureRasterLayers(store, manifest);
   } catch (error) {
     console.error("Layer compaction failed", error);
+    return manifest || await getManifest(store);
   }
 }
 
-async function ensureRasterLayers(store) {
-  const strokeKeys = await listStrokeKeys(store);
-  const existingLayers = await listLayerKeys(store);
-  const completedLayerCount = Math.floor(strokeKeys.length / COMPACT_EVERY);
+async function ensureRasterLayers(store, manifest = null) {
+  const next = manifest || await getManifest(store);
 
-  for (let index = existingLayers.length; index < completedLayerCount; index += 1) {
-    const layerKey = `layers/${String(index + 1).padStart(6, "0")}.png`;
-    const batchKeys = strokeKeys.slice(index * COMPACT_EVERY, (index + 1) * COMPACT_EVERY);
+  while (true) {
+    const keys = await listCurrentBatchKeys(store, next.currentBatch);
+    if (keys.length < COMPACT_EVERY) break;
+
+    const batchKeys = keys.slice(0, COMPACT_EVERY);
+    const carryoverKeys = keys.slice(COMPACT_EVERY);
     const strokes = await loadStrokeBatch(store, batchKeys);
-    if (strokes.length !== COMPACT_EVERY) return;
+    if (strokes.length !== COMPACT_EVERY) break;
+    const carryover = await loadStrokeBatch(store, carryoverKeys);
 
+    const layerKey = `layers/${String(next.currentBatch).padStart(6, "0")}.png`;
     const png = await renderLayer(strokes);
     await store.set(layerKey, png, {
       metadata: {
@@ -167,7 +177,22 @@ async function ensureRasterLayers(store) {
         height: RASTER_HEIGHT
       }
     });
+
+    if (!next.layers.includes(layerKey)) next.layers.push(layerKey);
+    next.compacted += strokes.length;
+    next.currentBatch += 1;
+    next.updatedAt = Date.now();
+
+    for (const stroke of carryover) {
+      await store.setJSON(strokeKey(next.currentBatch, stroke), stroke, {
+        metadata: { createdAt: stroke.createdAt }
+      });
+    }
+
+    await store.setJSON(MANIFEST_KEY, next);
   }
+
+  return next;
 }
 
 async function loadStrokeBatch(store, keys) {
@@ -202,14 +227,67 @@ function strokeToSvg(stroke) {
 }
 
 async function listStrokeKeys(store) {
-  const { blobs } = await store.list({ prefix: "strokes/" });
+  const { blobs } = await store.list({ prefix: "batches/" });
   return blobs
     .map((blob) => blob.key)
-    .filter((key) => /^strokes\/\d{13}-[0-9a-f-]{20,80}\.json$/i.test(key))
+    .filter((key) => /^batches\/\d{6}\/\d{13}-[0-9a-f-]{20,80}\.json$/i.test(key))
     .sort();
 }
 
-async function listLayerKeys(store) {
+async function listCurrentBatchKeys(store, batch) {
+  const prefix = `batches/${String(batch).padStart(6, "0")}/`;
+  const { blobs } = await store.list({ prefix });
+  return blobs
+    .map((blob) => blob.key)
+    .filter((key) => new RegExp(`^${prefix}\\d{13}-[0-9a-f-]{20,80}\\.json$`, "i").test(key))
+    .sort();
+}
+
+async function listLooseKeys(store, currentBatch) {
+  const current = await listCurrentBatchKeys(store, currentBatch);
+  if (currentBatch <= 1) return current;
+
+  const previous = await listCurrentBatchKeys(store, currentBatch - 1);
+  return [
+    ...previous.slice(COMPACT_EVERY),
+    ...current
+  ].sort();
+}
+
+async function getManifest(store) {
+  const value = await store.get(MANIFEST_KEY, { consistency: "strong", type: "json" });
+  if (value && Number.isInteger(value.currentBatch) && Array.isArray(value.layers)) {
+    return {
+      currentBatch: Math.max(1, value.currentBatch),
+      layers: value.layers.filter((key) => /^layers\/\d{6}\.png$/.test(key)).sort(),
+      compacted: Math.max(0, Number(value.compacted) || 0),
+      updatedAt: Number(value.updatedAt) || Date.now()
+    };
+  }
+
+  const existingStrokeKeys = await listStrokeKeys(store);
+  const existingLayers = await listExistingLayerKeys(store);
+  if (existingStrokeKeys.length) {
+    const batches = existingStrokeKeys
+      .map((key) => Number(key.match(/^batches\/(\d{6})\//)?.[1]))
+      .filter(Number.isFinite);
+    return {
+      currentBatch: Math.max(1, ...batches),
+      layers: existingLayers,
+      compacted: existingLayers.length * COMPACT_EVERY,
+      updatedAt: Date.now()
+    };
+  }
+
+  return {
+    currentBatch: 1,
+    layers: [],
+    compacted: 0,
+    updatedAt: Date.now()
+  };
+}
+
+async function listExistingLayerKeys(store) {
   const { blobs } = await store.list({ prefix: "layers/" });
   return blobs
     .map((blob) => blob.key)
@@ -221,7 +299,7 @@ function normalizeStroke(payload) {
   const id = typeof payload.id === "string" && /^[0-9a-f-]{20,80}$/i.test(payload.id)
     ? payload.id
     : crypto.randomUUID();
-  if (!["brush", "eraser"].includes(payload.tool)) {
+  if (!["brush", "eraser", "line", "rect", "ellipse"].includes(payload.tool)) {
     throw new Error("Unsupported drawing tool.");
   }
 
@@ -251,15 +329,19 @@ function normalizeStroke(payload) {
 
 function shouldFetchKey(key, since) {
   if (!since) return true;
-  const match = key.match(/^strokes\/(\d{13})-/);
+  const match = key.match(/^batches\/\d{6}\/(\d{13})-/);
   return !match || Number(match[1]) > since;
 }
 
 function isSupportedSavedStroke(stroke) {
   return stroke
-    && ["brush", "eraser"].includes(stroke.tool)
+    && ["brush", "eraser", "line", "rect", "ellipse"].includes(stroke.tool)
     && Array.isArray(stroke.points)
     && stroke.points.length > 1;
+}
+
+function strokeKey(batch, stroke) {
+  return `batches/${String(batch).padStart(6, "0")}/${stroke.createdAt}-${stroke.id}.json`;
 }
 
 function normalizePoint(point) {

@@ -15,6 +15,7 @@ const state = {
   size: Number(sizeInput.value),
   drawing: false,
   current: [],
+  preview: null,
   layers: [],
   layerImages: new Map(),
   strokes: [],
@@ -67,20 +68,33 @@ canvas.addEventListener("pointermove", (event) => {
   if (!state.drawing) return;
   const point = getPoint(event);
   const previous = state.current.at(-1);
-  state.current.push(point);
-  drawSegment(previous, point, makeStroke(state.current), state.current.length - 1);
+  if (state.tool === "brush" || state.tool === "eraser") {
+    state.current.push(point);
+    drawSegment(previous, point, makeStroke(state.current), state.current.length - 1);
+  } else {
+    state.current = [state.current[0], point];
+    state.preview = makeShapeStroke(state.current[0], point);
+    redrawAll();
+    drawStroke(state.preview);
+  }
 });
 
 canvas.addEventListener("pointerup", finishStroke);
 canvas.addEventListener("pointercancel", finishStroke);
 
 function setupControls() {
+  document.querySelectorAll("[data-tool]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.tool = button.dataset.tool;
+      eraseButton.classList.remove("active");
+      eraseButton.setAttribute("aria-pressed", "false");
+      setActive("[data-tool]", button);
+    });
+  });
+
   document.querySelectorAll("[data-color]").forEach((button) => {
     button.addEventListener("click", () => {
       state.color = button.dataset.color;
-      state.tool = "brush";
-      eraseButton.classList.remove("active");
-      eraseButton.setAttribute("aria-pressed", "false");
       setActive("[data-color]", button);
     });
   });
@@ -94,6 +108,7 @@ function setupControls() {
     state.tool = erasing ? "eraser" : "brush";
     eraseButton.classList.toggle("active", erasing);
     eraseButton.setAttribute("aria-pressed", String(erasing));
+    setActive("[data-tool]", erasing ? null : document.querySelector('[data-tool="brush"]'));
   });
 }
 
@@ -191,11 +206,13 @@ function finishStroke() {
   if (!state.drawing) return;
   state.drawing = false;
 
-  if (state.current.length > 1) {
-    saveStroke(makeStroke(simplifyPoints(state.current)));
+  const stroke = state.preview || makeStroke(simplifyPoints(state.current));
+  if (stroke.points.length > 1) {
+    saveStroke(stroke);
   }
 
   state.current = [];
+  state.preview = null;
 }
 
 function makeStroke(points) {
@@ -209,6 +226,43 @@ function makeStroke(points) {
   };
 }
 
+function makeShapeStroke(start, end) {
+  const tool = state.tool;
+  if (tool === "line") return { ...makeStroke([start, end]), tool: "line" };
+
+  const left = Math.min(start.x, end.x);
+  const right = Math.max(start.x, end.x);
+  const top = Math.min(start.y, end.y);
+  const bottom = Math.max(start.y, end.y);
+
+  if (tool === "rect") {
+    return {
+      ...makeStroke([
+        { x: left, y: top },
+        { x: right, y: top },
+        { x: right, y: bottom },
+        { x: left, y: bottom },
+        { x: left, y: top }
+      ]),
+      tool: "rect"
+    };
+  }
+
+  const points = [];
+  const centerX = (left + right) / 2;
+  const centerY = (top + bottom) / 2;
+  const radiusX = Math.max(0.001, (right - left) / 2);
+  const radiusY = Math.max(0.001, (bottom - top) / 2);
+  for (let index = 0; index <= 48; index += 1) {
+    const angle = (index / 48) * Math.PI * 2;
+    points.push({
+      x: centerX + Math.cos(angle) * radiusX,
+      y: centerY + Math.sin(angle) * radiusY
+    });
+  }
+  return { ...makeStroke(points), tool: "ellipse" };
+}
+
 function redrawAll() {
   ctx.clearRect(0, 0, state.canvasWidth, state.canvasHeight);
   for (const layer of state.layers) {
@@ -220,7 +274,7 @@ function redrawAll() {
 
 function drawStroke(stroke) {
   if (!stroke?.points?.length) return;
-  if (!["brush", "eraser"].includes(stroke.tool)) return;
+  if (!isDrawableTool(stroke.tool)) return;
 
   for (let index = 1; index < stroke.points.length; index += 1) {
     drawSegment(stroke.points[index - 1], stroke.points[index], stroke, index);
@@ -310,7 +364,7 @@ function mergeStrokes(...groups) {
   for (const group of groups) {
     for (const stroke of group || []) {
       if (!stroke?.points?.length) continue;
-      if (!["brush", "eraser"].includes(stroke.tool)) continue;
+      if (!isDrawableTool(stroke.tool)) continue;
       const key = stroke.id || `${stroke.createdAt}-${stroke.tool}-${stroke.points[0].x}-${stroke.points[0].y}`;
       byId.set(key, { ...byId.get(key), ...stroke, id: key });
     }
@@ -442,7 +496,11 @@ function flushPendingWithBeacon() {
 
 function isSupportedStroke(stroke) {
   return stroke
-    && ["brush", "eraser"].includes(stroke.tool)
+    && isDrawableTool(stroke.tool)
     && Array.isArray(stroke.points)
     && stroke.points.length > 1;
+}
+
+function isDrawableTool(tool) {
+  return ["brush", "eraser", "line", "rect", "ellipse"].includes(tool);
 }

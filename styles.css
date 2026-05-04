@@ -90,6 +90,31 @@ canvas {
   backdrop-filter: blur(12px);
 }
 
+.tools {
+  display: flex;
+  gap: 4px;
+  padding-right: 4px;
+}
+
+.tool {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: rgba(21, 21, 21, 0.8);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.tool.active {
+  background: var(--ink);
+  color: #fff;
+}
+
 .swatch,
 .erase {
   display: flex;
@@ -138,6 +163,7 @@ canvas {
     top: 10px;
     gap: 8px;
     padding: 7px;
+    overflow-x: auto;
   }
 
   .swatch {
