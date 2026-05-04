@@ -11,49 +11,17 @@
       <section class="stage" aria-label="Shared drawing canvas">
         <canvas id="wall" aria-label="Persistent drawing canvas"></canvas>
         <div class="status" id="status" role="status">Loading the wall...</div>
-      </section>
 
-      <aside class="toolbox" aria-label="Drawing tools">
-        <div class="brand">
-          <span class="brand-mark">✳</span>
-          <div>
-            <h1>Forever Doodle Wall</h1>
-            <p>Drawings save for future visitors.</p>
-          </div>
-        </div>
-
-        <div class="tools" role="toolbar" aria-label="Tools">
-          <button class="tool active" data-tool="brush" title="Brush" aria-label="Brush">✎</button>
-          <button class="tool" data-tool="rainbow" title="Rainbow brush" aria-label="Rainbow brush">◐</button>
-          <button class="tool" data-tool="spray" title="Spray" aria-label="Spray">░</button>
-          <button class="tool" data-tool="stamp" title="Stamp" aria-label="Stamp">★</button>
-          <button class="tool" data-tool="eraser" title="Eraser" aria-label="Eraser">⌫</button>
-        </div>
-
-        <div class="palette" aria-label="Colors">
+        <div class="toolbar" aria-label="Drawing controls">
           <button class="swatch active" style="--swatch:#111111" data-color="#111111" aria-label="Black"></button>
           <button class="swatch" style="--swatch:#ff3864" data-color="#ff3864" aria-label="Pink"></button>
-          <button class="swatch" style="--swatch:#ff8c1a" data-color="#ff8c1a" aria-label="Orange"></button>
           <button class="swatch" style="--swatch:#ffd500" data-color="#ffd500" aria-label="Yellow"></button>
           <button class="swatch" style="--swatch:#37c871" data-color="#37c871" aria-label="Green"></button>
           <button class="swatch" style="--swatch:#1e9bff" data-color="#1e9bff" aria-label="Blue"></button>
-          <button class="swatch" style="--swatch:#8b5cf6" data-color="#8b5cf6" aria-label="Purple"></button>
-          <button class="swatch" style="--swatch:#ffffff" data-color="#ffffff" aria-label="White"></button>
+          <input id="size" class="size" type="range" min="4" max="42" value="14" aria-label="Brush size">
+          <button class="erase" id="erase" aria-pressed="false" aria-label="Eraser">Erase</button>
         </div>
-
-        <label class="control">
-          <span>Size</span>
-          <input id="size" type="range" min="4" max="64" value="16">
-        </label>
-
-        <div class="stamps" aria-label="Stamp shapes">
-          <button class="stamp active" data-stamp="star" aria-label="Star stamp">★</button>
-          <button class="stamp" data-stamp="heart" aria-label="Heart stamp">♥</button>
-          <button class="stamp" data-stamp="flower" aria-label="Flower stamp">✿</button>
-          <button class="stamp" data-stamp="spark" aria-label="Spark stamp">✦</button>
-          <button class="stamp" data-stamp="moon" aria-label="Moon stamp">☾</button>
-        </div>
-      </aside>
+      </section>
     </main>
 
     <script src="/app.js" type="module"></script>

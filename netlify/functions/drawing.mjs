@@ -83,22 +83,17 @@ function normalizeStroke(payload) {
   const id = typeof payload.id === "string" && /^[0-9a-f-]{20,80}$/i.test(payload.id)
     ? payload.id
     : crypto.randomUUID();
-  const tool = pick(payload.tool, ["brush", "rainbow", "spray", "stamp", "eraser"], "brush");
+  const tool = pick(payload.tool, ["brush", "eraser"], "brush");
   const color = typeof payload.color === "string" && /^#[0-9a-f]{6}$/i.test(payload.color)
     ? payload.color
     : "#111111";
   const size = clamp(Number(payload.size), 2, 80, 12);
-  const stamp = pick(payload.stamp, ["star", "heart", "flower", "spark", "moon"], "star");
   const points = Array.isArray(payload.points)
     ? payload.points.slice(0, MAX_POINTS).map(normalizePoint).filter(Boolean)
     : [];
 
-  if (tool !== "stamp" && points.length < 2) {
+  if (points.length < 2) {
     throw new Error("A stroke needs at least two points.");
-  }
-
-  if (tool === "stamp" && points.length < 1) {
-    throw new Error("A stamp needs a point.");
   }
 
   return {
@@ -106,7 +101,6 @@ function normalizeStroke(payload) {
     tool,
     color,
     size,
-    stamp,
     points,
     createdAt: clamp(Number(payload.createdAt), 1_700_000_000_000, Date.now() + 86_400_000, Date.now()),
     receivedAt: Date.now()
